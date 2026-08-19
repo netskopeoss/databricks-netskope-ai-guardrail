@@ -1,0 +1,488 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Netskope AI Guardrails on Demand (Virtual Private Edge / VPE) — standalone
+  deployment. Provisions the VPE appliance in an ASG behind a private ALB with
+  a self-signed cert (HTTPS 443 -> appliance API on HTTP :8080) at a Route 53
+  private name. INFRASTRUCTURE ONLY: tenant-side activation (enroll node,
+  attach the AI Guardrails service template, generate the dataplane cert via
+  the VPE CLI) is a manual step — see README. The optional GPU LLM backend is
+  a separate VM and is NOT deployed here. Carved from the AWS-AIGW Reference
+  Architecture (jharris-ns); the only Lambda (inline cert generator) makes this
+  a single `aws cloudformation deploy` with no prebuilt artifacts.
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC to deploy AI Guardrails on Demand into.
+
+  AlbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Two subnets in different AZs for the internal ALB. Public or private
+      both work (the ALB is internal regardless). Each subnet must have at
+      least 8 free IPs (/24 or larger recommended; /28 is too small).
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      One or two private subnets WITH outbound internet (NAT gateway) for the
+      appliance. Outbound is required so the VPE can reach the Netskope
+      management plane to enroll and stay managed.
+
+  GuardrailsAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >
+      Netskope AI Guardrails on Demand (Virtual Private Edge / VPE) appliance
+      AMI ID, shared with your account by Netskope. Must be in the region you
+      deploy into (the shared image is in us-east-1; copy it or deploy in the
+      same region as the share).
+
+  GuardrailsInstanceType:
+    Type: String
+    Default: m5.2xlarge
+    AllowedValues:
+      - m5.2xlarge
+      - m5.4xlarge
+      - m6i.2xlarge
+      - m6i.4xlarge
+    Description: >
+      Instance type for the VPE appliance. Netskope virtual appliances need a
+      general-purpose instance with >= 8 vCPU and >= 32 GiB RAM (m5.2xlarge
+      meets the minimum). This is a CPU appliance — it does NOT need a GPU;
+      GPU-based LLM detection runs on a separate VM connected via the service
+      template.
+
+  GuardrailsApiPort:
+    Type: Number
+    Default: 8080
+    Description: >
+      Port the AI Guardrails on Demand API listens on (explicit-proxy mode).
+      The ALB target group forwards HTTP to this port. Default 8080.
+
+  GuardrailsHealthCheckPath:
+    Type: String
+    Default: /
+    Description: ALB health check path for the appliance API.
+
+  HostedZoneName:
+    Type: String
+    Default: aigw.internal
+    Description: >
+      Name of the Route 53 PRIVATE hosted zone to create and associate with
+      the VPC. Must be unique per VPC — if a zone with this name is already
+      associated with the VPC (e.g. from an AI Gateway or DLPoD deployment),
+      choose a different name (e.g. guardrails.internal) to avoid a
+      resolution collision.
+
+  GuardrailsDomainName:
+    Type: String
+    Default: guardrails.aigw.internal
+    Description: >
+      Internal FQDN clients use to reach the Guardrails ALB. Must be within
+      HostedZoneName. The self-signed ALB certificate CN/SAN matches this name.
+
+  GuardrailsMinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of appliance instances.
+
+  GuardrailsMaxCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Maximum number of appliance instances (allows manual scale-out).
+
+  GuardrailsDesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Desired number of appliance instances (typically 1).
+
+  GuardrailsKeyName:
+    Type: String
+    Default: ''
+    Description: >
+      Optional EC2 key pair for SSH access to the VPE appliance (needed for
+      manual enrollment / VPE CLI — the appliance accepts publickey auth only).
+      Leave blank to launch without a key pair.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - AlbSubnetIds
+          - PrivateSubnetIds
+      - Label:
+          default: Guardrails Appliance (VPE)
+        Parameters:
+          - GuardrailsAmiId
+          - GuardrailsInstanceType
+          - GuardrailsKeyName
+          - GuardrailsApiPort
+          - GuardrailsHealthCheckPath
+      - Label:
+          default: DNS & Certificate
+        Parameters:
+          - HostedZoneName
+          - GuardrailsDomainName
+      - Label:
+          default: Scaling
+        Parameters:
+          - GuardrailsMinCapacity
+          - GuardrailsDesiredCapacity
+          - GuardrailsMaxCapacity
+    ParameterLabels:
+      GuardrailsAmiId: { default: Guardrails on Demand (VPE) AMI ID }
+      GuardrailsDomainName: { default: Guardrails Internal FQDN }
+      GuardrailsApiPort: { default: Appliance API Port }
+
+Conditions:
+  HasGuardrailsKeyName: !Not [!Equals [!Ref GuardrailsKeyName, '']]
+
+Resources:
+
+  # =========================================================
+  # Cert storage
+  # =========================================================
+
+  GuardrailsCertParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::StackName}/guardrails-cert'
+      Type: String
+      Value: pending
+      Description: >
+        Self-signed ALB certificate PEM (populated by the cert generator
+        custom resource). Import this into any client trust store so it can
+        validate the Guardrails ALB endpoint.
+
+  # =========================================================
+  # Security Groups
+  # =========================================================
+
+  GuardrailsAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB for AI Guardrails on Demand service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.0.0.0/8'
+          Description: HTTPS from RFC1918 10.x
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '172.16.0.0/12'
+          Description: HTTPS from RFC1918 172.x
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '192.168.0.0/16'
+          Description: HTTPS from RFC1918 192.x
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref GuardrailsApiPort
+          ToPort: !Ref GuardrailsApiPort
+          CidrIp: '0.0.0.0/0'
+          Description: HTTP to appliance API
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-alb-sg'
+
+  GuardrailsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AI Guardrails on Demand (VPE) appliance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref GuardrailsApiPort
+          ToPort: !Ref GuardrailsApiPort
+          SourceSecurityGroupId: !Ref GuardrailsAlbSecurityGroup
+          Description: API port from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '10.0.0.0/8'
+          Description: SSH for VPE CLI activation (RFC1918 10.x)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '172.16.0.0/12'
+          Description: SSH for VPE CLI activation (RFC1918 172.x)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '192.168.0.0/16'
+          Description: SSH for VPE CLI activation (RFC1918 192.x)
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound (Netskope management plane, NTP, upgrades)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-sg'
+
+  # =========================================================
+  # Route 53 private hosted zone
+  # =========================================================
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref HostedZoneName
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref 'AWS::Region'
+      HostedZoneConfig:
+        Comment: !Sub 'Private zone for ${AWS::StackName} Guardrails ALB'
+
+  GuardrailsDnsRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: GuardrailsAlb
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Ref GuardrailsDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt GuardrailsAlb.DNSName
+        HostedZoneId: !GetAtt GuardrailsAlb.CanonicalHostedZoneID
+
+  # =========================================================
+  # Self-signed CA certificate -> ACM + SSM (inline custom resource)
+  # =========================================================
+
+  CertGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-certgen-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CertGenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ImportCertificate
+                  - acm:DeleteCertificate
+                  - acm:AddTagsToCertificate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  CertGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-certgen'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt CertGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import json, subprocess, tempfile, os, logging, urllib.request, boto3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          acm = boto3.client('acm')
+          ssm = boto3.client('ssm')
+          def send_cfn(event, context, status, data={}, pid=None):
+              body = json.dumps({'Status': status, 'Reason': f'See CloudWatch {context.log_group_name}/{context.log_stream_name}', 'PhysicalResourceId': pid or event.get('PhysicalResourceId','none'), 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data}).encode()
+              urllib.request.urlopen(urllib.request.Request(event['ResponseURL'], data=body, headers={'Content-Type':'','Content-Length':str(len(body))}, method='PUT'))
+          def handler(event, context):
+              domain = event['ResourceProperties']['DomainName']
+              cert_param = event['ResourceProperties']['CertParameterName']
+              stack = event['ResourceProperties']['StackName']
+              rt = event['RequestType']
+              try:
+                  if rt in ('Create', 'Update'):
+                      with tempfile.TemporaryDirectory() as d:
+                          kf, cf, sc = f'{d}/k.pem', f'{d}/c.pem', f'{d}/s.cnf'
+                          subprocess.run(['openssl','genrsa','-out',kf,'2048'], check=True, capture_output=True)
+                          with open(sc,'w') as f:
+                              f.write(f"[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN={domain}\nO=Netskope\nOU=AI Guardrails\n[v3]\nsubjectAltName=DNS:{domain}\nbasicConstraints=critical,CA:TRUE\nkeyUsage=digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage=serverAuth\n")
+                          subprocess.run(['openssl','req','-new','-x509','-key',kf,'-out',cf,'-days','365','-config',sc], check=True, capture_output=True)
+                          cert_pem = open(cf).read()
+                          key_pem = open(kf).read()
+                      r = acm.import_certificate(Certificate=cert_pem.encode(), PrivateKey=key_pem.encode(), Tags=[{'Key':'StackName','Value':stack}])
+                      arn = r['CertificateArn']
+                      ssm.put_parameter(Name=cert_param, Value=cert_pem, Type='String', Overwrite=True)
+                      send_cfn(event, context, 'SUCCESS', {'CertificateArn': arn}, arn)
+                  elif rt == 'Delete':
+                      arn = event.get('PhysicalResourceId','')
+                      if arn.startswith('arn:'):
+                          try: acm.delete_certificate(CertificateArn=arn)
+                          except: pass
+                      send_cfn(event, context, 'SUCCESS', {}, arn)
+              except Exception:
+                  logger.exception('Failed')
+                  send_cfn(event, context, 'FAILED', {}, 'FAILED')
+
+  GuardrailsCertificate:
+    Type: Custom::AlbCertificate
+    Properties:
+      ServiceToken: !GetAtt CertGeneratorFunction.Arn
+      DomainName: !Ref GuardrailsDomainName
+      CertParameterName: !Sub '/${AWS::StackName}/guardrails-cert'
+      StackName: !Ref 'AWS::StackName'
+      CertVersion: '1'
+
+  # =========================================================
+  # Private ALB fronting the Guardrails appliance
+  # =========================================================
+
+  GuardrailsAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-guardrails'
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref GuardrailsAlbSecurityGroup
+      Subnets: !Ref AlbSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-alb'
+
+  GuardrailsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # ELB target-group names cap at 32 chars; the stack name already
+      # contains "guardrails", so keep the physical name short (the Name tag
+      # below stays descriptive).
+      Name: !Sub '${AWS::StackName}-tg'
+      Protocol: HTTP
+      Port: !Ref GuardrailsApiPort
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: !Sub '${GuardrailsApiPort}'
+      HealthCheckPath: !Ref GuardrailsHealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-499
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-tg'
+
+  GuardrailsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GuardrailsAlb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !GetAtt GuardrailsCertificate.CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GuardrailsTargetGroup
+
+  # =========================================================
+  # Guardrails appliance — Launch Template + Auto Scaling Group
+  # VPE appliance boots and enrolls to the Netskope tenant; no
+  # UserData bootstrap and no instance IAM profile are required.
+  # =========================================================
+
+  GuardrailsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-guardrails-lt'
+      LaunchTemplateData:
+        ImageId: !Ref GuardrailsAmiId
+        InstanceType: !Ref GuardrailsInstanceType
+        KeyName: !If [HasGuardrailsKeyName, !Ref GuardrailsKeyName, !Ref 'AWS::NoValue']
+        SecurityGroupIds:
+          - !Ref GuardrailsSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              Encrypted: true
+              # Must be >= the VPE AMI snapshot size (500 GiB for VPE 1.1.31).
+              VolumeSize: 500
+              VolumeType: gp3
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-guardrails'
+
+  GuardrailsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-guardrails-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GuardrailsLaunchTemplate
+        Version: !GetAtt GuardrailsLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref GuardrailsMinCapacity
+      MaxSize: !Ref GuardrailsMaxCapacity
+      DesiredCapacity: !Ref GuardrailsDesiredCapacity
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      TargetGroupARNs:
+        - !Ref GuardrailsTargetGroup
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 900
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails'
+          PropagateAtLaunch: true
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  GuardrailsAlbDnsName:
+    Description: Internal ALB DNS name fronting the AI Guardrails on Demand appliance
+    Value: !GetAtt GuardrailsAlb.DNSName
+
+  GuardrailsHostUrl:
+    Description: >
+      Guardrails host URL to configure on clients once the appliance is
+      activated (enrolled + service template attached + dataplane cert).
+    Value: !Sub 'https://${GuardrailsDomainName}'
+
+  GuardrailsCertificateArn:
+    Description: ACM ARN of the self-signed ALB certificate
+    Value: !GetAtt GuardrailsCertificate.CertificateArn
+
+  CertParameterName:
+    Description: >
+      SSM parameter holding the ALB certificate PEM. Import this cert into
+      any client that must trust the Guardrails ALB endpoint.
+    Value: !Sub '/${AWS::StackName}/guardrails-cert'
+
+  GuardrailsAsgName:
+    Description: Guardrails Auto Scaling Group name
+    Value: !Ref GuardrailsAutoScalingGroup
+
+  PrivateHostedZoneId:
+    Value: !Ref PrivateHostedZone

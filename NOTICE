@@ -1,0 +1,22 @@
+Netskope AI Guardrails — Standalone CloudFormation Deployment
+Copyright 2026 Netskope, Inc.
+
+This product includes software derived from the AWS AI Gateway Reference
+Architecture by jharris-ns:
+
+    https://github.com/jharris-ns/AWS-AIGW-Reference-Architecture
+
+The AI Guardrails resources in the CloudFormation template
+(templates/guardrails-standalone.yaml) and the inline self-signed
+certificate generator are derived from that project, which is licensed under
+the Apache License, Version 2.0.
+
+This repository extracts and adapts ONLY the AI Guardrails portion of that
+reference architecture into a standalone deployment. The AI Gateway and
+DLP On Demand (DLPoD) components are intentionally omitted.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use these files except in compliance with the License. You may obtain a copy
+of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0

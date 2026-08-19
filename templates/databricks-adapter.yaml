@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Translation adapter between the Databricks Unity AI Gateway "External
+  Policy Direct HTTP API" (per the Aug 2026 Partner Integration Guide) and
+  the Netskope AI Guardrails on Demand evaluation API. Databricks POSTs
+  {event, config} to this API; the Lambda extracts the text under
+  evaluation, calls the AI Guardrails appliance over the internal ALB, and
+  returns the flat {result, reason} verdict the contract requires.
+  Auth is OAuth2 client-credentials (Cognito), the only method the
+  Databricks contract supports.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the AI Guardrails appliance (and its internal ALB) runs in.
+
+  LambdaSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Subnet(s) for the Lambda's VPC attachment. Any subnet in the same VPC as
+      the internal ALB works — the Lambda only needs VPC-local reachability
+      to it and DNS resolution of the private hosted zone; it does not need
+      NAT/internet egress.
+
+  AigodEvaluationUrl:
+    Type: String
+    Default: https://guardrails.aigw.internal/api/v2/aiguardrails/evaluation
+    Description: Full URL of the AI Guardrails evaluation API (internal ALB).
+
+  CertParameterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /netskope-guardrails/guardrails-cert
+    Description: >
+      SSM parameter holding the ALB's self-signed cert PEM (output by the main
+      guardrails-standalone stack). Resolved at deploy time and baked into the
+      Lambda's environment so no runtime SSM call/network egress is needed.
+
+  DefaultProfileId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional fallback AI Guardrails profile ID used if a Databricks
+      attachment's policy_config doesn't supply one. Leave blank to require
+      every attachment to pass its own profile_id.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - LambdaSubnetIds
+      - Label:
+          default: AI Guardrails Backend
+        Parameters:
+          - AigodEvaluationUrl
+          - CertParameterName
+          - DefaultProfileId
+
+Resources:
+
+  # =========================================================
+  # Auth — OAuth2 client-credentials (M2M). The Databricks contract
+  # supports ONLY OAuth M2M (no API key / Basic / OAuth U2M): the customer
+  # configures Host, path, Client ID/Secret, Token endpoint, and scope on
+  # their UC HTTP Connection, and Databricks fetches + attaches the bearer
+  # token itself on every call. Cognito's client-credentials flow gives us
+  # a real token endpoint with zero custom auth code — API Gateway's native
+  # JWT authorizer validates the token before the Lambda ever runs.
+  # =========================================================
+
+  AdapterUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: databricks-aigod-adapter
+
+  AdapterUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref AdapterUserPool
+      Domain: !Sub 'databricks-aigod-${AWS::AccountId}'
+
+  AdapterResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref AdapterUserPool
+      Identifier: guardrail
+      Name: AI Guardrails Evaluation
+      Scopes:
+        - ScopeName: evaluate
+          ScopeDescription: Evaluate content against AI Guardrails
+
+  AdapterAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: AdapterResourceServer
+    Properties:
+      UserPoolId: !Ref AdapterUserPool
+      ClientName: databricks-external-policy
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: ['guardrail/evaluate']
+      SupportedIdentityProviders: [COGNITO]
+
+  # =========================================================
+  # Lambda — the adapter itself
+  # =========================================================
+
+  AdapterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Databricks to AI Guardrails adapter Lambda (egress-only)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: To the internal ALB (VPC-local), no internet egress used
+      Tags:
+        - Key: Name
+          Value: databricks-aigod-adapter-sg
+
+  AdapterExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  AdapterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 8
+      MemorySize: 256
+      Role: !GetAtt AdapterExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref LambdaSubnetIds
+        SecurityGroupIds:
+          - !Ref AdapterSecurityGroup
+      Environment:
+        Variables:
+          AIGOD_URL: !Ref AigodEvaluationUrl
+          CA_CERT_PEM: !Ref CertParameterName
+          DEFAULT_PROFILE_ID: !Ref DefaultProfileId
+      Code:
+        ZipFile: |
+          import json, os, ssl, tempfile, urllib.request
+
+          CA_CERT_PEM = os.environ.get('CA_CERT_PEM', '')
+          AIGOD_URL = os.environ['AIGOD_URL']
+          DEFAULT_PROFILE_ID = os.environ.get('DEFAULT_PROFILE_ID', '')
+
+          # Auth is enforced by API Gateway's JWT authorizer (Cognito
+          # client-credentials) before this Lambda is ever invoked — no
+          # token handling needed here.
+
+          _cafile = None
+
+          def cafile():
+              global _cafile
+              if _cafile is None:
+                  f = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
+                  f.write(CA_CERT_PEM.encode())
+                  f.close()
+                  _cafile = f.name
+              return _cafile
+
+          def as_obj(value):
+              # Databricks documents policy_config as an opaque pass-through
+              # it "never parses" - in practice this means fields like
+              # policy_config (and possibly event/config/data) can arrive as
+              # a raw JSON-encoded STRING (whatever the customer typed into a
+              # text box) rather than an already-parsed object. Normalize
+              # either shape defensively so a str never hits .get() directly.
+              if isinstance(value, dict):
+                  return value
+              if isinstance(value, str):
+                  try:
+                      parsed = json.loads(value)
+                      return parsed if isinstance(parsed, dict) else {}
+                  except Exception:
+                      return {}
+              return {}
+
+          def text_from_content(content):
+              # A message's 'content' can be a plain string (Chat Completions)
+              # or a list of typed content blocks (Responses API: [{"type":
+              # "input_text"/"output_text", "text": "..."}, ...]).
+              if isinstance(content, str):
+                  return content
+              if isinstance(content, list):
+                  return "\n".join(
+                      b.get('text', '') for b in content
+                      if isinstance(b, dict) and isinstance(b.get('text'), str)
+                  )
+              return ''
+
+          def extract_text(ev):
+              # Shape depends on event.type (lowercase, per the Databricks
+              # Partner Integration Guide): tool_call / tool_result /
+              # model_call / model_result. The model payload itself may be
+              # either the Chat Completions shape (messages[].content as a
+              # string) or the newer Responses API shape (input[]/output[]
+              # with content as a list of typed blocks) - handle both.
+              t = ev.get('type', '')
+              d = as_obj(ev.get('data'))
+              if t == 'model_call':
+                  turns = d.get('messages') or d.get('input') or []
+                  u = [text_from_content(m.get('content')) for m in turns if isinstance(m, dict) and m.get('role') == 'user']
+                  u = [x for x in u if x]
+                  return "\n".join(u) if u else json.dumps(d)[:4000]
+              if t == 'model_result':
+                  ch = d.get('choices')
+                  if isinstance(ch, list) and ch:
+                      c = [x.get('message', {}).get('content', '') for x in ch if isinstance(x, dict)]
+                      c = [text_from_content(x) if not isinstance(x, str) else x for x in c]
+                      c = [x for x in c if x]
+                      if c:
+                          return "\n".join(c)
+                  out = d.get('output') or []
+                  c = [text_from_content(x.get('content')) for x in out if isinstance(x, dict)]
+                  c = [x for x in c if x]
+                  return "\n".join(c) if c else json.dumps(d)[:4000]
+              if t == 'tool_call':
+                  return json.dumps(d.get('arguments', d))[:4000]
+              # tool_result and anything else: evaluate the raw payload.
+              return json.dumps(d)[:4000]
+
+          def deny(reason):
+              # Flat {result, reason} — the contract has no wrapper object.
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({"result": "DENY", "reason": reason}),
+              }
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get('body') or '{}')
+                  ev = as_obj(body.get('event'))
+                  cfg = as_obj(body.get('config'))
+                  # Customer-facing config lives under config.policy_config
+                  # (an opaque pass-through Databricks never parses); we
+                  # define 'profile_id' as the key our evaluator looks for.
+                  # policy_config itself may arrive as a JSON string (the raw
+                  # text typed into the Policy configuration box) rather than
+                  # a parsed object - as_obj() handles both.
+                  policy_config = as_obj(cfg.get('policy_config'))
+                  profile_id = policy_config.get('profile_id') or DEFAULT_PROFILE_ID
+                  if not profile_id:
+                      return deny("AI Guardrails: no profile_id configured in policy_config")
+
+                  text = extract_text(ev)
+                  payload = json.dumps({
+                      "text": text,
+                      "profiles": {"ai-guardrails": [profile_id]},
+                  }).encode()
+
+                  ctx = ssl.create_default_context(cafile=cafile())
+                  req = urllib.request.Request(
+                      AIGOD_URL, data=payload, method='POST',
+                      headers={'Content-Type': 'application/json'},
+                  )
+                  with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+                      result = json.loads(resp.read())
+
+                  verdict = result.get('data', {}).get('verdict')
+                  if verdict == 'Match':
+                      details = result.get('data', {}).get('matchDetails', [])
+                      cats = [x.get('category') for p in details for x in p.get('profileDetails', [])]
+                      reason = ("Blocked: " + ", ".join(filter(None, cats))) if cats else "Blocked by AI Guardrails"
+                      decision = "DENY"
+                  elif verdict == 'Not Match':
+                      decision, reason = "ALLOW", ""
+                  else:
+                      return deny(f"AI Guardrails: unexpected verdict '{verdict}'")
+              except Exception as e:
+                  # Fail closed — matches the Databricks contract (timeout,
+                  # error, or unrecognized verdict all fail closed on their
+                  # side regardless, but we return a clean DENY + reason
+                  # ourselves whenever we can).
+                  return deny(f"AI Guardrails unavailable: {e}")
+
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({"result": decision, "reason": reason}),
+              }
+
+  # HTTP API + Lambda proxy integration, gated by a Cognito JWT authorizer.
+  # (A plain Lambda Function URL with AuthType: NONE was tried first but
+  # this account rejects public, unauthenticated Function URLs at the org
+  # level regardless of resource policy — API Gateway invokes via the
+  # apigateway.amazonaws.com service principal instead of a public "*"
+  # principal, which sidesteps that guardrail, and separately gives us the
+  # JWT authorizer this contract actually requires.)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: databricks-aigod-adapter
+      ProtocolType: HTTP
+
+  HttpApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: cognito-client-credentials
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${AdapterUserPool}'
+        Audience:
+          - !Ref AdapterAppClient
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdapterFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref HttpApiAuthorizer
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  HttpApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdapterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  AdapterHost:
+    Description: >
+      Host for the Databricks UC HTTP Connection (scheme + host only; leave
+      the connection's 'path' field blank/'/').
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  OAuthClientId:
+    Description: OAuth M2M Client ID for the UC HTTP Connection.
+    Value: !Ref AdapterAppClient
+
+  OAuthTokenEndpoint:
+    Description: OAuth M2M Token endpoint URL for the UC HTTP Connection.
+    Value: !Sub 'https://databricks-aigod-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  OAuthScope:
+    Description: OAuth scope for the UC HTTP Connection (optional field).
+    Value: 'guardrail/evaluate'
+
+  UserPoolId:
+    Description: >
+      Cognito User Pool ID — needed to retrieve the Client Secret:
+      aws cognito-idp describe-user-pool-client --user-pool-id <this> --client-id <OAuthClientId> --query UserPoolClient.ClientSecret --output text
+    Value: !Ref AdapterUserPool
+
+  AdapterFunctionArn:
+    Value: !GetAtt AdapterFunction.Arn
