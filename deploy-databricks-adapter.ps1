@@ -5,10 +5,11 @@
 # cert is pulled from SSM at deploy time - no S3 artifacts.
 #
 #   1) Deploy the Guardrails appliance first (./deploy.ps1) and activate it.
-#   2) Fill in LAMBDA_SUBNET_IDS in .env (VPC_ID is reused from the same
-#      .env used for the appliance - the Lambda just needs a subnet in that
-#      same VPC; it does not need internet/NAT access).
-#   3) Run:  ./deploy-databricks-adapter.ps1
+#   2) Run:  ./deploy-databricks-adapter.ps1
+#      No VPC_ID/LAMBDA_SUBNET_IDS needed - this script auto-discovers them
+#      from the Guardrails stack's own VpcId/PrivateSubnetIds outputs. Only
+#      set those in .env if you want to point the adapter at a different/
+#      existing VPC instead.
 #
 # See docs/databricks-integration.md for the Databricks-side setup after
 # this completes.
@@ -37,18 +38,33 @@ Get-Content .env | ForEach-Object {
 }
 if ($env:CA_BUNDLE) { $env:AWS_CA_BUNDLE = $env:CA_BUNDLE }
 
-$region = if ($env:AWS_REGION) { $env:AWS_REGION } else { 'us-east-1' }
-$stack  = if ($env:DATABRICKS_ADAPTER_STACK_NAME) { $env:DATABRICKS_ADAPTER_STACK_NAME } else { 'netskope-databricks-adapter' }
+$region          = if ($env:AWS_REGION) { $env:AWS_REGION } else { 'us-east-1' }
+$stack           = if ($env:DATABRICKS_ADAPTER_STACK_NAME) { $env:DATABRICKS_ADAPTER_STACK_NAME } else { 'netskope-databricks-adapter' }
+$guardrailsStack = if ($env:STACK_NAME) { $env:STACK_NAME } else { 'netskope-guardrails' }
 
-foreach ($req in 'VPC_ID','LAMBDA_SUBNET_IDS') {
-    if (-not (Get-Item "env:$req" -ErrorAction SilentlyContinue).Value) {
-        throw "Missing required value '$req' in .env"
-    }
+# Auto-discover the VPC/subnet from the Guardrails stack's own outputs
+# (it provisions its own network - see templates/guardrails-standalone.yaml)
+# unless overridden in .env (e.g. to point at a different/existing VPC).
+$vpcId = if ($env:VPC_ID) { $env:VPC_ID } else {
+    aws cloudformation describe-stacks --stack-name $guardrailsStack --region $region `
+      --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" --output text
 }
+$lambdaSubnetIds = if ($env:LAMBDA_SUBNET_IDS) { $env:LAMBDA_SUBNET_IDS } else {
+    # PrivateSubnetIds is a comma-joined list (both private subnets) - the
+    # adapter template's LambdaSubnetIds param accepts a list, so pass it
+    # straight through rather than picking just one.
+    aws cloudformation describe-stacks --stack-name $guardrailsStack --region $region `
+      --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnetIds'].OutputValue" --output text
+}
+if (-not $vpcId -or -not $lambdaSubnetIds) {
+    throw "Could not auto-discover VpcId/PrivateSubnetIds from stack '$guardrailsStack' - " +
+          "deploy the Guardrails appliance first (./deploy.ps1), or set VPC_ID / LAMBDA_SUBNET_IDS in .env manually."
+}
+Write-Host "Using VPC $vpcId / subnet $lambdaSubnetIds (from stack '$guardrailsStack')"
 
 $overrides = @(
-    "VpcId=$env:VPC_ID",
-    "LambdaSubnetIds=$env:LAMBDA_SUBNET_IDS"
+    "VpcId=$vpcId",
+    "LambdaSubnetIds=$lambdaSubnetIds"
 )
 if ($env:AIGOD_EVALUATION_URL)  { $overrides += "AigodEvaluationUrl=$env:AIGOD_EVALUATION_URL" }
 if ($env:CERT_PARAMETER_NAME)   { $overrides += "CertParameterName=$env:CERT_PARAMETER_NAME" }

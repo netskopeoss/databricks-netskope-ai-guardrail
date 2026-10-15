@@ -66,27 +66,49 @@ handling, troubleshooting).
 |-------------|-------|
 | **VPE appliance AMI** | Netskope-shared "Virtual Private Edge (VPE)" AMI for AI Guardrails on Demand. Typically shared in **us-east-1**. |
 | **Netskope tenant w/ Guardrails on Demand** | Beta feature — have Netskope enable it, and configure at least one AI Guardrails profile (you'll need its profile ID). |
-| **Existing VPC** | Private subnets with **outbound internet (NAT)** for the appliance's management-plane connectivity; any subnet in the same VPC works for the Lambda adapter (no NAT needed there). |
-| **2 ALB subnets** | Different AZs, each with **≥ 8 free IPs** (`/24`+ recommended). |
-| **In-VPC CLI access** | A bastion / SSH path to reach the appliance for the one-time activation step. |
+| ~~Existing VPC~~ | **Not needed** — `guardrails-standalone.yaml` creates its own VPC, NAT gateway, and all networking. See "Networking" below for the cost trade-off this implies. |
+| **EC2 key pair** | Existing key pair in the region, for SSH to the appliance as `nsadmin` (one-time dataplane-cert CLI step). |
+| **In-VPC CLI access** | The stack has no bastion. SSH the appliance from a host in the VPC, or over peering/VPN/TGW (`AdditionalClientCidr`) — or use an EC2 Instance Connect Endpoint (see "After deployment"). |
 | **Databricks workspace** | Unity Catalog enabled, and the External Policies (Direct HTTP API) private preview enabled — confirm with your Databricks account team. |
 | **Databricks permissions** | `CREATE CONNECTION` (or metastore admin) to create the UC HTTP Connection; `MANAGE` on the schema of the service you'll govern. |
 | **AWS CLI** | Configured for the target account/region. |
 
 ---
 
+## Networking
+
+`guardrails-standalone.yaml` creates its own VPC — the same layout as the
+upstream [AWS-AIGW Reference Architecture](https://github.com/jharris-ns/AWS-AIGW-Reference-Architecture):
+an Internet Gateway, 2 public + 2 private `/24` subnets across two AZs, one
+NAT gateway + EIP, route tables, and an S3 gateway endpoint. The ALB and the
+appliance both run in the private subnets (no public IP on either). Nothing
+to pre-create.
+
+**The trade-off:** the NAT gateway this creates has its own recurring AWS
+cost (roughly $32-35/month, plus data processing), separate from however
+your organization already pays for NAT elsewhere. For a long-lived
+production deployment where reusing an existing VPC/NAT matters more than
+zero-prerequisite setup, that's a real fork-point in the template (reintroduce
+`VpcId`/subnet parameters), not a flag this repo exposes.
+
+`deploy-databricks-adapter.ps1` auto-discovers the VPC/subnet it needs from
+the Guardrails stack's own `VpcId`/`PrivateSubnetIds` outputs, so there's
+nothing to wire up manually between the two stacks either.
+
+---
+
 ## Quick start
 
 ```powershell
-# 1. Deploy the Guardrails appliance
-cp .env.example .env      # fill in VPC_ID, ALB_SUBNET_IDS, PRIVATE_SUBNET_IDS, GUARDRAILS_AMI_ID
+# 1. Deploy the Guardrails appliance (creates its own VPC/NAT - see "Networking" above)
+cp .env.example .env      # fill in GUARDRAILS_AMI_ID, GUARDRAILS_KEY_NAME
 ./deploy.ps1
 
 # 2. Activate it manually (see the solutions guide, Part 2) —
 #    enroll in the Netskope UI, then set the license key and generate the
 #    forward-proxy cert via the VPE CLI over SSH.
 
-# 3. Deploy the Databricks adapter (fill in LAMBDA_SUBNET_IDS in the same .env)
+# 3. Deploy the Databricks adapter (VPC/subnet auto-discovered from stack 1)
 ./deploy-databricks-adapter.ps1
 
 # 4. Configure Databricks — create the UC HTTP Connection with the printed
@@ -106,12 +128,11 @@ solutions guide's parameter tables.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `VpcId` | ✅ | — | Existing VPC. |
-| `AlbSubnetIds` | ✅ | — | Two subnets (different AZs) for the internal ALB. |
-| `PrivateSubnetIds` | ✅ | — | Private subnet(s) with NAT for the appliance. |
+| `VpcCidr` | | `10.5.0.0/16` | CIDR for the new VPC (`/16`-`/22`); four `/24` subnets are carved from it. |
+| `AdditionalClientCidr` | | *(empty)* | Optional extra CIDR (peered VPC/VPN/TGW) allowed to reach the ALB (443) and appliance (SSH). |
 | `GuardrailsAmiId` | ✅ | — | Netskope VPE appliance AMI ID. |
+| `GuardrailsKeyName` | ✅ | — | Existing EC2 key pair for SSH as `nsadmin`. |
 | `GuardrailsInstanceType` | | `m5.2xlarge` | CPU general-purpose, ≥ 8 vCPU / 32 GiB. **No GPU** — GPU-based detection is a separate, optional VM (not part of this stack). |
-| `GuardrailsKeyName` | | *(blank)* | EC2 key pair for SSH access (needed for manual activation and Databricks-side profile lookups). |
 | `HostedZoneName` | | `aigw.internal` | Route 53 private zone name (must be unique per VPC). |
 | `GuardrailsDomainName` | | `guardrails.aigw.internal` | Internal FQDN; matches the cert CN/SAN. |
 | `GuardrailsMinCapacity` / `GuardrailsDesiredCapacity` / `GuardrailsMaxCapacity` | | `1` / `1` / `2` | Appliance instance count. |
@@ -120,8 +141,8 @@ solutions guide's parameter tables.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `VpcId` | ✅ | — | Same VPC as the Guardrails appliance. |
-| `LambdaSubnetIds` | ✅ | — | Any subnet in that VPC (no NAT/internet needed). |
+| `VpcId` | ✅ | — | VPC for the adapter Lambda. `deploy-databricks-adapter.ps1` auto-fills this from the Guardrails stack's `VpcId` output — only pass it yourself for raw `aws cloudformation deploy`. |
+| `LambdaSubnetIds` | ✅ | — | Subnet(s) in that VPC (no NAT/internet needed). Auto-filled the same way from `PrivateSubnetIds`. |
 | `AigodEvaluationUrl` | | `https://guardrails.aigw.internal/api/v2/aiguardrails/evaluation` | Override only if you changed `HostedZoneName`/`GuardrailsDomainName` above. |
 | `CertParameterName` | | `/netskope-guardrails/guardrails-cert` | Override only if you used a different `STACK_NAME`. |
 | `DefaultProfileId` | | *(blank)* | Optional fallback AI Guardrails profile ID. |
@@ -144,7 +165,11 @@ solutions guide's parameter tables.
 2. Enroll the node and attach templates in the Netskope UI: *Settings →
    Security Cloud Platform → On-Premises Infrastructure*.
 3. SSH in and set the license key + generate the forward-proxy cert (see
-   the solutions guide, Part 2, for exact commands).
+   the solutions guide, Part 2, for exact commands). The appliance has no
+   public IP and the stack has no bastion — if you have no peering/VPN,
+   create an EC2 Instance Connect Endpoint in one of the stack's
+   `PrivateSubnetIds` and tunnel through it rather than trying to reach the
+   appliance directly.
 4. Deploy the Databricks adapter, then configure Databricks (Parts 3–4 of
    the solutions guide, or `docs/databricks-integration.md`).
 5. Test (Part 5) — send a benign prompt and a policy-violating prompt
@@ -154,7 +179,8 @@ solutions guide's parameter tables.
 
 **Guardrails appliance:** `GuardrailsHostUrl`, `GuardrailsAlbDnsName`,
 `GuardrailsCertificateArn`, `CertParameterName`, `GuardrailsAsgName`,
-`PrivateHostedZoneId`.
+`PrivateHostedZoneId`, `VpcId`, `PrivateSubnetIds`, `PublicSubnetIds`,
+`NatGatewayPublicIp`.
 
 **Databricks adapter:** `AdapterHost`, `OAuthClientId`, `OAuthTokenEndpoint`,
 `OAuthScope`, `UserPoolId` (used to retrieve the Client Secret),
@@ -198,6 +224,10 @@ NOTICE / LICENSE                Apache-2.0 + attribution to jharris-ns
 - **The appliance is a VPE, not a container.** No ECR, no GPU on this
   instance — GPU-based detection runs on a separate, optional VM the VPE
   connects to via the service template.
+- **This stack creates its own VPC, NAT gateway, and subnets** — see
+  "Networking" above. Deleting `netskope-guardrails` tears the VPC down too
+  (nothing orphaned to clean up separately), but the NAT gateway bills for
+  every hour it exists in the meantime.
 - **Activation is manual (Beta).** Neither template enrolls the node or
   generates the dataplane cert — do that via the Netskope UI + VPE CLI.
 - **Databricks OAuth M2M is the only supported auth method** for External

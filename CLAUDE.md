@@ -26,13 +26,21 @@ speak incompatible schemas.
 
 ## Architecture
 
+0. **The template creates its own VPC** — same layout as the upstream
+   AWS-AIGW Reference Architecture: Internet Gateway, 2 public + 2 private
+   `/24` subnets across two AZs, one NAT gateway + EIP, route tables, and an
+   S3 gateway endpoint. The ALB and the appliance both run in the private
+   subnets (no public IP on either). No existing VPC/subnets needed — the
+   trade-off is a real recurring NAT gateway cost (~$32-35/mo) per
+   deployment. See README "Networking" before reverting this to an
+   existing-VPC model; it's a deliberate choice, not an oversight.
 1. **ASG launches the VPE appliance** from the Netskope-shared VPE AMI on a
-   general-purpose CPU instance (≥ 8 vCPU / 32 GiB).
+   general-purpose CPU instance (≥ 8 vCPU / 32 GiB), in a private subnet.
 2. The appliance boots and reaches the **Netskope management plane** outbound
-   (via NAT) to be managed.
-3. An **internal ALB** serves **HTTPS 443** (self-signed cert) and forwards to
-   the appliance API on **HTTP :8080**; **Route 53** resolves the internal
-   domain name to the ALB.
+   (via the NAT gateway) to be managed.
+3. An **internal ALB**, also in the private subnets, serves **HTTPS 443**
+   (self-signed cert) and forwards to the appliance API on **HTTP :8080**;
+   **Route 53** resolves the internal domain name to the ALB.
 4. **Activation is manual** (Netskope Beta). Verified working sequence:
    1. Enroll the node + attach the **platform** and **AI Guardrails service**
       templates in the Netskope UI (*Settings → Security Cloud Platform →
@@ -179,7 +187,7 @@ reasoning about what "should" work:
 ## Deployment
 
 ```powershell
-cp .env.example .env   # fill in your VPC/subnet/AMI IDs
+cp .env.example .env   # fill in your AMI ID / key pair name (no VPC/subnets needed)
 ./deploy.ps1                       # 1. Guardrails appliance
 # ... activate manually (see docs/databricks-integration.md or the solutions guide) ...
 ./deploy-databricks-adapter.ps1    # 2. Databricks adapter
@@ -197,8 +205,13 @@ is no build step and no S3 upload for either stack.
 - **AMI region.** Check with your Netskope account team which region the AMI
   is shared in; cross-region copy needs Netskope to also share the backing
   snapshot (and KMS key if encrypted).
-- **ALB subnets need ≥ 8 free IPs each** — `/28` is too small.
-- **Private subnets need outbound internet (NAT)** for the management plane.
+- **The template creates its own VPC, NAT gateway, and subnets** — no
+  existing VPC required. This means a real recurring NAT gateway cost per
+  deployment; see README "Networking" before reverting to an existing-VPC
+  model, since that's a deliberate trade-off someone should decide on
+  explicitly, not drift back into silently.
+- **No bastion in the VPC** — SSH the appliance via an EC2 Instance Connect
+  Endpoint in a private subnet, or peering/VPN/TGW (`AdditionalClientCidr`).
 - **`HostedZoneName` must be unique per VPC.**
 - **Activation is manual (Beta)** — the template does not enroll the node or
   generate the dataplane cert.

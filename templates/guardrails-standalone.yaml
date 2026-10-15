@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Netskope AI Guardrails on Demand (Virtual Private Edge / VPE) — standalone
-  deployment. Provisions the VPE appliance in an ASG behind a private ALB with
-  a self-signed cert (HTTPS 443 -> appliance API on HTTP :8080) at a Route 53
+  deployment. Creates a new VPC with all networking (public + private subnets
+  in two AZs, internet gateway, NAT gateway, route tables, S3 endpoint), then
+  provisions the VPE appliance in an ASG behind a private ALB with a
+  self-signed cert (HTTPS 443 -> appliance API on HTTP :8080) at a Route 53
   private name. INFRASTRUCTURE ONLY: tenant-side activation (enroll node,
   attach the AI Guardrails service template, generate the dataplane cert via
   the VPE CLI) is a manual step — see README. The optional GPU LLM backend is
@@ -14,23 +16,25 @@ Description: >
 # Parameters
 # ============================================================
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Existing VPC to deploy AI Guardrails on Demand into.
-
-  AlbSubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
+  VpcCidr:
+    Type: String
+    Default: '10.5.0.0/16'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-2])$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block between /16 and /22.
     Description: >
-      Two subnets in different AZs for the internal ALB. Public or private
-      both work (the ALB is internal regardless). Each subnet must have at
-      least 8 free IPs (/24 or larger recommended; /28 is too small).
+      CIDR block for the new VPC. Four /24 subnets (2 public, 2 private) are
+      carved from it, so use /22 or larger. Must not overlap networks you
+      plan to peer or connect to this VPC.
 
-  PrivateSubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
+  AdditionalClientCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be empty or a valid IPv4 CIDR block.
     Description: >
-      One or two private subnets WITH outbound internet (NAT gateway) for the
-      appliance. Outbound is required so the VPE can reach the Netskope
-      management plane to enroll and stay managed.
+      Optional extra CIDR (e.g. a peered VPC, Transit Gateway or VPN range)
+      allowed to reach the ALB on 443 and the appliance on SSH 22. Leave empty
+      to allow only the new VPC's own CIDR.
 
   GuardrailsAmiId:
     Type: AWS::EC2::Image::Id
@@ -39,6 +43,14 @@ Parameters:
       AMI ID, shared with your account by Netskope. Must be in the region you
       deploy into (the shared image is in us-east-1; copy it or deploy in the
       same region as the share).
+
+  GuardrailsKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Existing EC2 key pair for SSH access to the appliance as nsadmin
+      (one-time dataplane-cert CLI activation step). SSH is restricted by the
+      security group to the VPC CIDR (plus AdditionalClientCidr), so it must
+      be reached from inside the VPC or over peering/VPN/Transit Gateway.
 
   GuardrailsInstanceType:
     Type: String
@@ -72,8 +84,8 @@ Parameters:
     Default: aigw.internal
     Description: >
       Name of the Route 53 PRIVATE hosted zone to create and associate with
-      the VPC. Must be unique per VPC — if a zone with this name is already
-      associated with the VPC (e.g. from an AI Gateway or DLPoD deployment),
+      the new VPC. If you later associate this VPC with others that already
+      resolve the same zone name (e.g. an AI Gateway or DLPoD deployment),
       choose a different name (e.g. guardrails.internal) to avoid a
       resolution collision.
 
@@ -102,29 +114,19 @@ Parameters:
     MinValue: 1
     Description: Desired number of appliance instances (typically 1).
 
-  GuardrailsKeyName:
-    Type: String
-    Default: ''
-    Description: >
-      Optional EC2 key pair for SSH access to the VPE appliance (needed for
-      manual enrollment / VPE CLI — the appliance accepts publickey auth only).
-      Leave blank to launch without a key pair.
-
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
           default: Network
         Parameters:
-          - VpcId
-          - AlbSubnetIds
-          - PrivateSubnetIds
+          - VpcCidr
+          - AdditionalClientCidr
       - Label:
           default: Guardrails Appliance (VPE)
         Parameters:
           - GuardrailsAmiId
           - GuardrailsInstanceType
-          - GuardrailsKeyName
           - GuardrailsApiPort
           - GuardrailsHealthCheckPath
       - Label:
@@ -139,14 +141,171 @@ Metadata:
           - GuardrailsDesiredCapacity
           - GuardrailsMaxCapacity
     ParameterLabels:
+      VpcCidr: { default: VPC CIDR }
+      AdditionalClientCidr: { default: Additional client CIDR (optional) }
       GuardrailsAmiId: { default: Guardrails on Demand (VPE) AMI ID }
       GuardrailsDomainName: { default: Guardrails Internal FQDN }
       GuardrailsApiPort: { default: Appliance API Port }
 
 Conditions:
-  HasGuardrailsKeyName: !Not [!Equals [!Ref GuardrailsKeyName, '']]
+  HasAdditionalClientCidr: !Not [!Equals [!Ref AdditionalClientCidr, '']]
 
 Resources:
+
+  # =========================================================
+  # VPC and networking
+  # Public subnets hold the NAT gateway; the ALB and appliance live in the
+  # private subnets. Private egress goes out through a single NAT gateway
+  # (the appliance must reach the Netskope management plane).
+  # =========================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-2'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
 
   # =========================================================
   # Cert storage
@@ -171,28 +330,26 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Internal ALB for AI Guardrails on Demand service
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: '10.0.0.0/8'
-          Description: HTTPS from RFC1918 10.x
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: '172.16.0.0/12'
-          Description: HTTPS from RFC1918 172.x
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: '192.168.0.0/16'
-          Description: HTTPS from RFC1918 192.x
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from within the VPC
+        - !If
+          - HasAdditionalClientCidr
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: !Ref AdditionalClientCidr
+            Description: HTTPS from additional client CIDR
+          - !Ref AWS::NoValue
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: !Ref GuardrailsApiPort
           ToPort: !Ref GuardrailsApiPort
-          CidrIp: '0.0.0.0/0'
+          CidrIp: !Ref VpcCidr
           Description: HTTP to appliance API
       Tags:
         - Key: Name
@@ -202,7 +359,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: AI Guardrails on Demand (VPE) appliance
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: !Ref GuardrailsApiPort
@@ -212,18 +369,16 @@ Resources:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: '10.0.0.0/8'
-          Description: SSH for VPE CLI activation (RFC1918 10.x)
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: '172.16.0.0/12'
-          Description: SSH for VPE CLI activation (RFC1918 172.x)
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: '192.168.0.0/16'
-          Description: SSH for VPE CLI activation (RFC1918 192.x)
+          CidrIp: !Ref VpcCidr
+          Description: SSH for VPE CLI activation (from within the VPC)
+        - !If
+          - HasAdditionalClientCidr
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AdditionalClientCidr
+            Description: SSH for VPE CLI activation (additional client CIDR)
+          - !Ref AWS::NoValue
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: '0.0.0.0/0'
@@ -241,14 +396,13 @@ Resources:
     Properties:
       Name: !Ref HostedZoneName
       VPCs:
-        - VPCId: !Ref VpcId
+        - VPCId: !Ref Vpc
           VPCRegion: !Ref 'AWS::Region'
       HostedZoneConfig:
         Comment: !Sub 'Private zone for ${AWS::StackName} Guardrails ALB'
 
   GuardrailsDnsRecord:
     Type: AWS::Route53::RecordSet
-    DependsOn: GuardrailsAlb
     Properties:
       HostedZoneId: !Ref PrivateHostedZone
       Name: !Ref GuardrailsDomainName
@@ -357,12 +511,13 @@ Resources:
   GuardrailsAlb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub '${AWS::StackName}-guardrails'
       Scheme: internal
       Type: application
       SecurityGroups:
         - !Ref GuardrailsAlbSecurityGroup
-      Subnets: !Ref AlbSubnetIds
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-guardrails-alb'
@@ -370,13 +525,9 @@ Resources:
   GuardrailsTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      # ELB target-group names cap at 32 chars; the stack name already
-      # contains "guardrails", so keep the physical name short (the Name tag
-      # below stays descriptive).
-      Name: !Sub '${AWS::StackName}-tg'
       Protocol: HTTP
       Port: !Ref GuardrailsApiPort
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       TargetType: instance
       HealthCheckProtocol: HTTP
       HealthCheckPort: !Sub '${GuardrailsApiPort}'
@@ -417,15 +568,14 @@ Resources:
       LaunchTemplateData:
         ImageId: !Ref GuardrailsAmiId
         InstanceType: !Ref GuardrailsInstanceType
-        KeyName: !If [HasGuardrailsKeyName, !Ref GuardrailsKeyName, !Ref 'AWS::NoValue']
+        KeyName: !Ref GuardrailsKeyName
         SecurityGroupIds:
           - !Ref GuardrailsSecurityGroup
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
             Ebs:
               Encrypted: true
-              # Must be >= the VPE AMI snapshot size (500 GiB for VPE 1.1.31).
-              VolumeSize: 500
+              VolumeSize: 1024
               VolumeType: gp3
         MetadataOptions:
           HttpTokens: required
@@ -438,6 +588,7 @@ Resources:
 
   GuardrailsAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: PrivateRoute
     Properties:
       AutoScalingGroupName: !Sub '${AWS::StackName}-guardrails-asg'
       LaunchTemplate:
@@ -446,7 +597,9 @@ Resources:
       MinSize: !Ref GuardrailsMinCapacity
       MaxSize: !Ref GuardrailsMaxCapacity
       DesiredCapacity: !Ref GuardrailsDesiredCapacity
-      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
       TargetGroupARNs:
         - !Ref GuardrailsTargetGroup
       HealthCheckType: EC2
@@ -486,3 +639,19 @@ Outputs:
 
   PrivateHostedZoneId:
     Value: !Ref PrivateHostedZone
+
+  VpcId:
+    Description: ID of the VPC created by this stack
+    Value: !Ref Vpc
+
+  PrivateSubnetIds:
+    Description: Private subnets (ALB + appliance)
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+
+  PublicSubnetIds:
+    Description: Public subnets (NAT gateway)
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+
+  NatGatewayPublicIp:
+    Description: Egress IP of the NAT gateway (allow-list for the Netskope management plane if required)
+    Value: !Ref NatEip
